@@ -78,87 +78,174 @@ class ChatBot:
             logger.error(f"Failed to initialize ChatBot: {e}")
             raise
 
-    def _is_ticket(self, message: str) -> bool:
+    def _classify_message(self, message: str) -> str:
         """
-        Determine if a message looks like a support ticket.
-
-        A message is considered a ticket if it:
-        - Contains the word "ticket" (case-insensitive)
-        - Is multi-line (has newlines)
-        - Contains PHI patterns (names, emails, phones, etc.)
-        - Is longer than typical questions (>100 chars)
+        Classify message into one of three types:
+        - 'pii_ticket': Support ticket with actual PII to detect
+        - 'dev_ticket': Development/PM ticket about requirements and compliance
+        - 'question': General policy question
 
         Args:
             message: Input message text
 
         Returns:
-            True if message appears to be a ticket, False otherwise
+            Message type: 'pii_ticket', 'dev_ticket', or 'question'
         """
         try:
             if not message or not message.strip():
-                return False
+                return 'question'
 
             message_lower = message.lower()
 
-            # Check for explicit ticket keywords
-            ticket_keywords = ['ticket', 'incident', 'case', 'issue #', 'ticket #']
-            has_ticket_keyword = any(keyword in message_lower for keyword in ticket_keywords)
-
-            # Check if multi-line
-            has_multiple_lines = '\n' in message.strip()
-
-            # Check for PHI patterns (quick check without full detection)
-            # Email pattern
+            # Check for actual PII patterns (real user data)
             has_email = bool(re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', message))
-
-            # Phone pattern
             has_phone = bool(re.search(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', message))
-
-            # SSN/SIN pattern (includes Canadian SIN format)
             has_ssn = bool(re.search(r'\b\d{3}-\d{2,3}-\d{3,4}\b', message))
+            has_account = bool(re.search(r'\b(?:account|acct|patient)\s*#?\s*:?\s*[A-Z0-9]{5,}\b', message, re.IGNORECASE))
+            has_dob = bool(re.search(r'\b(?:dob|date of birth|born)[\s:]+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b', message_lower))
 
-            # Account number pattern
-            has_account = bool(re.search(r'\b(?:account|acct|id|patient)\s*#?\s*\d{5,}\b', message_lower))
+            phi_count = sum([has_email, has_phone, has_ssn, has_account, has_dob])
 
-            # Count PHI indicators
-            phi_count = sum([has_email, has_phone, has_ssn, has_account])
-            has_phi_patterns = phi_count > 0
-
-            # Check length
-            is_long = len(message) > 100
-
-            # Context clues that suggest a ticket
-            ticket_context_words = ['user', 'customer', 'patient', 'client', 'reports', 'issue', 'problem', 'request']
-            has_context = any(word in message_lower for word in ticket_context_words)
-
-            # Decision logic:
-            # If it has "ticket" keyword, it's likely a ticket
-            if has_ticket_keyword:
-                return True
-
-            # If it's multi-line AND has PHI patterns, likely a ticket
-            if has_multiple_lines and has_phi_patterns:
-                return True
-
-            # If it's long AND has PHI patterns, likely a ticket
-            if is_long and has_phi_patterns:
-                return True
-
-            # If it has multiple PHI indicators (2+), it's likely a ticket
+            # If has 2+ actual PII items, it's a support ticket with PII
             if phi_count >= 2:
-                return True
+                logger.info("Classified as: PII Support Ticket")
+                return 'pii_ticket'
 
-            # If it has PHI AND ticket context words, likely a ticket
-            if has_phi_patterns and has_context:
-                return True
+            # Check for development/PM ticket indicators
+            dev_indicators = [
+                'pm ', 'product manager', 'project manager',
+                'developing', 'building', 'creating', 'implementing',
+                'feature', 'functionality', 'system', 'application',
+                'storing', 'store', 'database', 'save',
+                'encryption', 'encrypt', 'security measure',
+                'technology', 'technical', 'architecture',
+                'requirement', 'compliance', 'regulation',
+                'chat message', 'messaging system', 'communication',
+                'between user', 'between patient', 'between client'
+            ]
 
-            # Otherwise, treat as a question
-            return False
+            has_dev_indicators = sum(1 for ind in dev_indicators if ind in message_lower)
+
+            # Check for question words (common in dev tickets)
+            question_words = ['should', 'need', 'require', 'must', 'recommend', 'what', 'how']
+            has_questions = any(qw in message_lower for qw in question_words)
+
+            # If it has dev indicators AND questions, it's a dev ticket
+            if has_dev_indicators >= 2 and has_questions:
+                logger.info("Classified as: Development/Requirements Ticket")
+                return 'dev_ticket'
+
+            # Default to general question
+            logger.info("Classified as: General Policy Question")
+            return 'question'
 
         except Exception as e:
-            logger.error(f"Error in _is_ticket: {e}")
-            # Default to treating as question if check fails
-            return False
+            logger.error(f"Error in _classify_message: {e}")
+            return 'question'
+
+    def answer_dev_ticket(self, ticket_text: str, top_k: int = 3, return_prompt: bool = False):
+        """
+        Answer a development/PM ticket about technical requirements and compliance.
+
+        Args:
+            ticket_text: Development ticket text
+            top_k: Number of context chunks to retrieve
+            return_prompt: If True, return tuple with prompt and metadata
+
+        Returns:
+            LLM-generated answer with policy guidance and technical recommendations
+        """
+        try:
+            logger.info("Processing development ticket...")
+
+            # Query RAG system for relevant compliance context
+            logger.info("Retrieving relevant policy context...")
+            context_chunks = self.rag.query(ticket_text, top_k=top_k)
+
+            if not context_chunks:
+                msg = (
+                    "I don't have enough policy information to provide guidance. "
+                    "Please ensure policy documents have been loaded into the system."
+                )
+                if return_prompt:
+                    return msg, "", []
+                return msg
+
+            logger.info(f"Retrieved {len(context_chunks)} relevant chunks")
+
+            # Build enhanced prompt for development requirements
+            context_text = "\n\n".join([
+                f"[Source: {metadata.get('source', 'Unknown').split('/')[-1]}]\n{text}"
+                for text, metadata, score in context_chunks
+            ])
+
+            full_prompt = f"""You are a privacy compliance advisor helping development teams.
+
+DEVELOPMENT TICKET:
+{ticket_text}
+
+RELEVANT PRIVACY REGULATIONS AND POLICIES:
+{context_text}
+
+Please provide:
+1. **Compliance Requirements**: What privacy regulations apply?
+2. **Required Security Measures**: What technical safeguards are required (encryption, access controls, etc.)?
+3. **Technology Recommendations**: Specific technologies or approaches recommended for compliance
+4. **Risk Assessment**: What privacy risks need to be addressed?
+5. **Best Practices**: Additional recommendations for implementation
+
+Be specific and actionable in your recommendations."""
+
+            # Generate response with LLM
+            logger.info("Generating LLM response...")
+            response = self.llm.generate(
+                prompt=full_prompt,
+                max_tokens=600,  # More tokens for comprehensive guidance
+                temperature=0.4
+            )
+
+            if response:
+                if return_prompt:
+                    return response, full_prompt, context_chunks
+                return response
+            else:
+                # Fallback
+                logger.warning("LLM generation failed, returning context directly")
+                fallback = self._format_basic_answer(ticket_text, context_chunks)
+                if return_prompt:
+                    return fallback, full_prompt, context_chunks
+                return fallback
+
+        except ValueError as e:
+            logger.error(f"RAG error: {e}")
+            error_msg = (
+                "The policy knowledge base is not yet loaded. "
+                "Please load policy documents before processing development tickets."
+            )
+            if return_prompt:
+                return error_msg, "", []
+            return error_msg
+
+        except Exception as e:
+            logger.error(f"Error processing development ticket: {e}")
+            error_msg = f"Error processing development ticket: {str(e)}"
+            if return_prompt:
+                return error_msg, "", []
+            return error_msg
+
+    def _is_ticket(self, message: str) -> bool:
+        """
+        Determine if a message looks like a support ticket (backward compatibility).
+        Now uses the new classification system internally.
+
+        Args:
+            message: Input message text
+
+        Returns:
+            True if message is any type of ticket, False if it's a question
+        """
+        msg_type = self._classify_message(message)
+        return msg_type in ['pii_ticket', 'dev_ticket']
 
     def _assess_risk_level(self, detections: List[Dict]) -> str:
         """
@@ -270,15 +357,17 @@ class ChatBot:
             logger.error(f"Error building policy prompt: {e}")
             raise
 
-    def analyze_ticket(self, text: str) -> str:
+    def analyze_ticket(self, text: str, return_prompt: bool = False):
         """
-        Analyze a support ticket for PHI and privacy risks.
+        Analyze a support ticket for PHI and privacy risks using RAG-grounded responses.
 
         Args:
             text: Support ticket text
+            return_prompt: If True, return tuple of (response, prompt, detections, risk_level, context_chunks)
 
         Returns:
-            LLM-generated analysis of the ticket with risk assessment
+            LLM-generated analysis of the ticket with risk assessment based on policy documents
+            Or tuple if return_prompt is True
         """
         try:
             logger.info("Analyzing ticket for PHI...")
@@ -292,42 +381,103 @@ class ChatBot:
             risk_level = self._assess_risk_level(detections)
             logger.info(f"Risk level: {risk_level}")
 
-            # Build detection prompt using helper method
-            full_prompt = self._build_detection_prompt(
-                ticket=text,
-                detections=detections,
-                risk=risk_level
-            )
+            # Build RAG query based on detected PII types and risk level
+            detected_types = set(d['type'] for d in detections)
+            rag_query = f"How should we handle and protect {', '.join(detected_types)} information? What are the security requirements and privacy obligations for {risk_level} risk personal information?"
+
+            # Retrieve relevant policy context using RAG
+            logger.info("Retrieving relevant policy guidance from knowledge base...")
+            try:
+                context_chunks = self.rag.query(rag_query, top_k=3)
+            except Exception as rag_error:
+                logger.warning(f"RAG query failed: {rag_error}, continuing without policy context")
+                context_chunks = []
+
+            # Build enhanced prompt with policy context
+            if context_chunks:
+                context_text = "\n\n".join([
+                    f"[Policy Source: {metadata.get('source', 'Unknown').split('/')[-1]}]\n{text}"
+                    for text, metadata, score in context_chunks
+                ])
+
+                full_prompt = f"""You are a privacy compliance advisor. Analyze this support ticket for PII and provide guidance based on Canadian privacy regulations.
+
+SUPPORT TICKET:
+{text}
+
+DETECTED PII:
+{self._format_detections_for_prompt(detections)}
+
+RISK LEVEL: {risk_level}
+
+RELEVANT PRIVACY REGULATIONS:
+{context_text}
+
+Based on the detected PII and the privacy regulations above, provide:
+1. **Summary of Detected PII**: List what was found
+2. **Risk Assessment**: Explain the privacy risks
+3. **Handling Requirements**: What regulations apply and what's required
+4. **Recommended Actions**: Specific steps to protect this information
+5. **Compliance Notes**: Any additional compliance considerations
+
+Be specific and cite the relevant regulations."""
+            else:
+                # Fallback if RAG fails
+                full_prompt = self._build_detection_prompt(
+                    ticket=text,
+                    detections=detections,
+                    risk=risk_level
+                )
 
             # Generate response with LLM
             logger.info("Generating LLM response...")
             response = self.llm.generate(
                 prompt=full_prompt,
-                max_tokens=1500,
+                max_tokens=600,  # Increased for more comprehensive guidance
                 temperature=0.3  # Lower temperature for more consistent analysis
             )
 
             if response:
+                if return_prompt:
+                    return response, full_prompt, detections, risk_level, context_chunks
                 return response
             else:
                 # Fallback if LLM fails
                 logger.warning("LLM generation failed, returning basic analysis")
-                return self._format_basic_detection(detections, risk_level)
+                fallback = self._format_basic_detection(detections, risk_level)
+                if return_prompt:
+                    return fallback, full_prompt, detections, risk_level, context_chunks
+                return fallback
 
         except Exception as e:
             logger.error(f"Error analyzing ticket: {e}")
-            return f"Error analyzing ticket: {str(e)}"
+            error_msg = f"Error analyzing ticket: {str(e)}"
+            if return_prompt:
+                return error_msg, "", [], "LOW", []
+            return error_msg
 
-    def answer_question(self, question: str, top_k: int = 3) -> str:
+    def _format_detections_for_prompt(self, detections: List[Dict]) -> str:
+        """Format detections for inclusion in prompt."""
+        if not detections:
+            return "No PII detected"
+
+        lines = []
+        for det in detections:
+            lines.append(f"- {det['type']}: {det['value']}")
+        return "\n".join(lines)
+
+    def answer_question(self, question: str, top_k: int = 2, return_prompt: bool = False):
         """
         Answer a privacy policy question using RAG and LLM.
 
         Args:
             question: User's question about privacy policies
             top_k: Number of context chunks to retrieve
+            return_prompt: If True, return tuple of (response, prompt, context_chunks)
 
         Returns:
             LLM-generated answer with citations
+            Or tuple if return_prompt is True
         """
         try:
             logger.info(f"Answering question: {question}")
@@ -337,10 +487,13 @@ class ChatBot:
             context_chunks = self.rag.query(question, top_k=top_k)
 
             if not context_chunks:
-                return (
+                msg = (
                     "I don't have enough policy information to answer that question. "
                     "Please ensure policy documents have been loaded into the system."
                 )
+                if return_prompt:
+                    return msg, "", []
+                return msg
 
             logger.info(f"Retrieved {len(context_chunks)} relevant chunks")
 
@@ -354,56 +507,105 @@ class ChatBot:
             logger.info("Generating LLM response...")
             response = self.llm.generate(
                 prompt=full_prompt,
-                max_tokens=1500,
+                max_tokens=400,  # Reduced for faster response
                 temperature=0.4  # Slightly higher for more natural language
             )
 
             if response:
+                if return_prompt:
+                    return response, full_prompt, context_chunks
                 return response
             else:
                 # Fallback if LLM fails
                 logger.warning("LLM generation failed, returning context directly")
-                return self._format_basic_answer(question, context_chunks)
+                fallback = self._format_basic_answer(question, context_chunks)
+                if return_prompt:
+                    return fallback, full_prompt, context_chunks
+                return fallback
 
         except ValueError as e:
             # Handle empty collection
             logger.error(f"RAG error: {e}")
-            return (
+            error_msg = (
                 "The policy knowledge base is not yet loaded. "
                 "Please load policy documents before asking questions."
             )
+            if return_prompt:
+                return error_msg, "", []
+            return error_msg
 
         except Exception as e:
             logger.error(f"Error answering question: {e}")
-            return f"Error processing question: {str(e)}"
+            error_msg = f"Error processing question: {str(e)}"
+            if return_prompt:
+                return error_msg, "", []
+            return error_msg
 
-    def chat(self, message: str) -> str:
+    def chat(self, message: str, return_prompt: bool = False):
         """
         Main chat interface - routes messages to appropriate handler.
 
         Args:
             message: User's input message
+            return_prompt: If True, return tuple with prompt and metadata
 
         Returns:
-            ChatBot response (either ticket analysis or question answer)
+            ChatBot response (PII ticket, dev ticket, or question answer)
+            Or tuple if return_prompt is True: (response, prompt, metadata, message_type)
         """
         try:
             if not message or not message.strip():
-                return "Please provide a message or question."
+                msg = "Please provide a message or question."
+                if return_prompt:
+                    return msg, "", {}, 'question'
+                return msg
 
             logger.info(f"Processing message (length: {len(message)} chars)")
 
-            # Determine message type and route
-            if self._is_ticket(message):
-                logger.info("Message identified as ticket")
-                return self.analyze_ticket(message)
+            # Classify message type
+            msg_type = self._classify_message(message)
+            logger.info(f"Message classified as: {msg_type}")
+
+            if msg_type == 'pii_ticket':
+                # Support ticket with actual PII
+                logger.info("Processing as PII support ticket")
+                if return_prompt:
+                    response, prompt, detections, risk_level, context_chunks = self.analyze_ticket(message, return_prompt=True)
+                    metadata = {
+                        'detections': detections,
+                        'risk_level': risk_level,
+                        'context_chunks': context_chunks
+                    }
+                    return response, prompt, metadata, 'pii_ticket'
+                else:
+                    return self.analyze_ticket(message)
+
+            elif msg_type == 'dev_ticket':
+                # Development/PM ticket about requirements
+                logger.info("Processing as development/requirements ticket")
+                if return_prompt:
+                    response, prompt, context_chunks = self.answer_dev_ticket(message, return_prompt=True)
+                    metadata = {'context_chunks': context_chunks, 'ticket_type': 'development'}
+                    return response, prompt, metadata, 'dev_ticket'
+                else:
+                    return self.answer_dev_ticket(message)
+
             else:
-                logger.info("Message identified as question")
-                return self.answer_question(message)
+                # General policy question
+                logger.info("Processing as policy question")
+                if return_prompt:
+                    response, prompt, context_chunks = self.answer_question(message, return_prompt=True)
+                    metadata = {'context_chunks': context_chunks}
+                    return response, prompt, metadata, 'question'
+                else:
+                    return self.answer_question(message)
 
         except Exception as e:
             logger.error(f"Error in chat: {e}")
-            return f"An error occurred: {str(e)}"
+            error_msg = f"An error occurred: {str(e)}"
+            if return_prompt:
+                return error_msg, "", {}, 'question'
+            return error_msg
 
     def _format_basic_detection(self, detections: List[Dict], risk_level: str) -> str:
         """

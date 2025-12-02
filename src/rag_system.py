@@ -10,7 +10,6 @@ import logging
 
 try:
     import chromadb
-    from chromadb.config import Settings
     from sentence_transformers import SentenceTransformer
 except ImportError as e:
     raise ImportError(
@@ -49,11 +48,10 @@ class RAGSystem:
             self.model = SentenceTransformer(model_name)
             logger.info(f"Loaded embedding model: {model_name}")
 
-            # Initialize ChromaDB client
-            self.client = chromadb.Client(Settings(
-                persist_directory=persist_directory,
-                anonymized_telemetry=False
-            ))
+            # Initialize ChromaDB client with persistence
+            self.client = chromadb.PersistentClient(
+                path=persist_directory
+            )
 
             # Get or create collection
             self.collection = self.client.get_or_create_collection(
